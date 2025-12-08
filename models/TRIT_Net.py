@@ -14,12 +14,12 @@ class ConvLayer(nn.Sequential):
             self.add_module('conv', nn.Conv2d(in_channels, out_channels, kernel_size=kernel,
                                               stride=stride, padding=kernel//2, bias = False, dilation = dilation_this))
             self.add_module('norm', nn.BatchNorm2d(out_channels))
-            self.add_module('relu', nn.ReLU(inplace=True))
+            self.add_module('relu', nn.ReLU())
         else:
             self.add_module('conv', nn.Conv2d(in_channels, out_channels, kernel_size=kernel,
                                                 padding='same', bias = False, dilation = dilation_this))
             self.add_module('norm', nn.BatchNorm2d(out_channels))
-            self.add_module('relu', nn.ReLU(inplace=True))
+            self.add_module('relu', nn.ReLU())
 
 
     def forward(self, x):
@@ -32,13 +32,13 @@ class MyDecoder(nn.Sequential):
         self.add_module('conv', nn.Conv2d(in_channels=in_channels, out_channels=16,
                                           kernel_size=(1, 1), stride=1, padding=0, bias=True))
         self.add_module('norm', nn.BatchNorm2d(16))
-        self.add_module('relu', nn.ReLU(inplace=True))
+        self.add_module('relu', nn.ReLU())
 
         ###
         self.add_module('conv_b', nn.Conv2d(in_channels=16, out_channels=48,
                                             kernel_size=(3, 3), stride=1, padding=0, bias=True))
         self.add_module('norm_b', nn.BatchNorm2d(48))
-        self.add_module('relu_b', nn.ReLU(inplace=True))
+        self.add_module('relu_b', nn.ReLU())
 
         ###
 
@@ -186,7 +186,7 @@ def chunks(data: Iterable, sizes: List[int]):
     curr = 0
     for size in sizes:
         chunk = data[curr: curr + size]
-        curr += size
+        curr = curr + size
         yield chunk
 
 
@@ -272,7 +272,7 @@ class HarDBlock(nn.Module):
                 link.append(k)
 
                 if i > 0:
-                    out_channels *= grmul
+                    out_channels = out_channels * grmul
 
 
         out_channels = int(int(out_channels + 1) / 2) * 2
@@ -280,7 +280,7 @@ class HarDBlock(nn.Module):
 
         for i in link:
             ch,_,_ = self.get_link(i, base_ch, growth_rate, grmul)
-            in_channels += ch
+            in_channels = in_channels + ch
 
         return out_channels, in_channels, link
 
@@ -314,7 +314,7 @@ class HarDBlock(nn.Module):
 
 
             if (i % 2 == 0) or (i == n_layers - 1):
-                self.out_channels += outch
+                self.out_channels = self.out_channels + outch
 
         self.layers = nn.ModuleList(layers_)
 
@@ -422,11 +422,11 @@ class TRITNetEncoder_arch(nn.Module):
         self.proj = nn.Sequential(
             nn.LazyLinear(8192, bias=False),
             nn.BatchNorm1d(8192),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
 
             nn.Linear(8192, 8192, bias=False),
             nn.BatchNorm1d(8192),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
 
             nn.Linear(8192, self.embedding_size, bias=False), 
         )
@@ -524,7 +524,7 @@ class TRITNet(nn.Module):
         self.finalConv = nn.Conv2d(in_channels=cur_channels_count,
                             out_channels=self.n_classes, kernel_size=1, stride=1,
                             padding=0, bias=True)
-        self.relu_on_finalConv = nn.ReLU(inplace=True)
+        self.relu_on_finalConv = nn.ReLU()
 
 
 

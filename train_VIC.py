@@ -4,8 +4,16 @@ import torch
 import random
 from pprint import pformat
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler   # added for multi-GPU
 import os, time
 from torch.cuda.amp import autocast, GradScaler
+import torch.nn as nn
+
+import torch.distributed as dist                              # added for multi-GPU
+from torch.nn.parallel import DistributedDataParallel as DDP  # added for multi-GPU
+
+from models import get_model
+
 
 from models import get_model
 from optimizers import get_optimizer
@@ -14,6 +22,43 @@ from data.augmentation import image_transform,TwoCrops
 from data.VIC_loader import UnlabeledImages
 from losses.VICreg_loss import vicreg_loss
 from utils import get_logger, save_checkpoint
+
+# added for multi-GPU
+def setup_distributed():
+    """
+    Detect whether we're in distributed mode (torchrun or Slurm multi-GPU)
+    and initialize torch.distributed if needed.
+
+    Returns:
+        is_dist (bool): are we in distributed mode?
+        local_rank (int): index of GPU on this node
+        global_rank (int): rank among all processes
+        world_size (int): total number of processes
+        device (torch.device): CUDA device for this process
+    """
+    # If RANK is not set, assume single-process / single-GPU
+    if "RANK" not in os.environ:
+        is_dist = False
+        local_rank = 0
+        global_rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return is_dist, local_rank, global_rank, world_size, device
+
+    # torchrun sets these
+    global_rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    # Initialize the process group
+    dist.init_process_group(backend="nccl")
+
+    # Each process should use its own GPU
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    is_dist = True
+    return is_dist, local_rank, global_rank, world_size, device
 
 
 def parse_args(args=None):
@@ -26,7 +71,7 @@ def parse_args(args=None):
     parser.add_argument("--max_iters", default=90000, type=int)
     parser.add_argument("--accum", type=int, default=8)
     parser.add_argument("--optimizer", default="lars", type=str)
-    parser.add_argument("--learning_rate", default=0.001, type=float)
+    parser.add_argument("--learning_rate", default=0.8, type=float)
     parser.add_argument("--weight_decay", default=0.0005, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--scheduler", default="cosine_annealing", type=str)
@@ -71,11 +116,27 @@ def train(args,logger):
         torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
+    
+    torch.autograd.set_detect_anomaly(True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_dist, local_rank, global_rank, world_size, device = setup_distributed()   # added for multi-GPU
+    
+    # added for multi-GPU
+    if global_rank == 0:
+        print(f"Distributed: {is_dist}, world_size={world_size}")
 
-    model = get_model(args.arch)          
+    model = get_model(args.arch)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.to(device)
+    
+    # added for multi-GPU to initialize the Lazy modules
+    dummy = torch.randn(2, 3, args.image_size, args.image_size, device=device)
+    with torch.no_grad():
+        _ = model(dummy)
+
+    # added for multi-GPU
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -84,7 +145,7 @@ def train(args,logger):
         print(f"Loaded checkpoint from {args.checkpoint}")
 
 
-    base_lr = 0.2 * (args.batch_size * args.accum / 256.0) * 4 
+    base_lr = args.learning_rate * args.batch_size * args.accum * world_size / 256.0 
     wd = 1e-6 if args.optimizer.lower() == "lars" else args.weight_decay
 
     enc_decay, enc_nodecay = [], []
@@ -137,18 +198,39 @@ def train(args,logger):
 
     transform = TwoCrops(image_transform(args.image_size, args.RGB_mean, args.RGB_std))
     dataset   = UnlabeledImages(args.dir_dataset, transform)
-
-    loader    = DataLoader(dataset,
-                           batch_size=args.batch_size,
-                           shuffle=True,
-                           num_workers=args.num_workers,
-                           pin_memory=True,
-                           drop_last=True)
+    
+    # added for multi-GPU
+    if is_dist:
+        train_sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        shuffle = False  # DataLoader must NOT shuffle when using a sampler
+    else:
+        train_sampler = None
+        shuffle = True
+    
+    # added for multi-GPU
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
     
     scaler = GradScaler(enabled=args.amp)
     model.train()
     it = iter(loader)
     step, t0 = 0, time.time()
+    
+    # added for multi-GPU: track an artificial "epoch" for the sampler
+    epoch = 0
 
     while step < args.max_iters:
         optimizer.zero_grad(set_to_none=True)
@@ -158,6 +240,10 @@ def train(args,logger):
             try:
                 x1, x2 = next(it)
             except StopIteration:
+                # added for multi-GPU: advance epoch & reshuffle for DistributedSampler
+                if is_dist and train_sampler is not None:
+                    epoch += 1
+                    train_sampler.set_epoch(epoch)
                 it = iter(loader)
                 x1, x2 = next(it)
 
@@ -194,13 +280,21 @@ def train(args,logger):
                 f"std1={avg['std1']:.4f} std2={avg['std2']:.4f} "
                 f"lr={c_lr[0]:.6f} z1={tuple(z1.shape)} z2={tuple(z2.shape)}  ~{fps:.1f} img/s"
             )
-            logger.info(msg); print(msg); t0 = time.time()
+            
+            # added for multi-GPU
+            if (not is_dist) or (global_rank == 0):
+                logger.info(msg)
+                print(msg)
+
+            t0 = time.time()
         
-        if (step + 1) % args.save_every == 0:            
-            path = save_checkpoint(
-                args, step + 1, model,
-            )
-            logger.info(f"Saved checkpoint: {path}")
+        if (step + 1) % args.save_every == 0:
+            # added for multi-GPU
+            if (not is_dist) or (global_rank == 0):
+                path = save_checkpoint(
+                    args, step + 1, model,
+                )
+                logger.info(f"Saved checkpoint: {path}")
 
 
         step += 1 
