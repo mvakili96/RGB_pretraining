@@ -21,7 +21,7 @@ from schedulers import get_scheduler
 from data.augmentation import image_transform,TwoCrops
 from data.VIC_loader import UnlabeledImages
 from losses.VICreg_loss import vicreg_loss
-from utils import get_logger, save_checkpoint
+from utils import get_logger, save_checkpoint, save_training_state
 
 # added for multi-GPU
 def setup_distributed():
@@ -65,6 +65,7 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Rail Scene Network Pretraining with VICReg Style")
     parser.add_argument("--arch", default="TRIT-Net-Encoder", type=str)
     parser.add_argument("--checkpoint", default="", type=str)
+    parser.add_argument("--resume", default="", type=str, help="path to checkpoint to resume from")
     parser.add_argument("--dir_dataset", default="/run/determined/workdir/nas2/Mohammadjavad/jpgs", type=str)
     parser.add_argument("--dir_log", default="./", type=str)
     parser.add_argument("--batch_size", default=64, type=int)
@@ -126,7 +127,9 @@ def train(args,logger):
         print(f"Distributed: {is_dist}, world_size={world_size}")
 
     model = get_model(args.arch)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # added for multi-GPU
+    if is_dist:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.to(device)
     
     # added for multi-GPU to initialize the Lazy modules
@@ -225,12 +228,42 @@ def train(args,logger):
     )
     
     scaler = GradScaler(enabled=args.amp)
+
+    start_step = 0
+    epoch = 0
+
+    if args.resume:
+        if (not is_dist) or (global_rank == 0):
+            logger.info(f"Resuming training from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+
+        # model weights
+        model_state = checkpoint.get("model", checkpoint.get("state_dict", None))
+        if model_state is not None:
+            if isinstance(model, DDP):
+                model.module.load_state_dict(model_state, strict=True)
+            else:
+                model.load_state_dict(model_state, strict=True)
+
+        # optimizer / scheduler / scaler
+        if "optimizer" in checkpoint and checkpoint["optimizer"] is not None:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        if "scaler" in checkpoint and checkpoint["scaler"] is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+
+        start_step = checkpoint.get("step", 0)
+        epoch = checkpoint.get("epoch", 0)
+
+
+    # make sure sampler knows which epoch we’re at
+    if is_dist and train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
     model.train()
     it = iter(loader)
-    step, t0 = 0, time.time()
-    
-    # added for multi-GPU: track an artificial "epoch" for the sampler
-    epoch = 0
+    step, t0 = start_step, time.time()
 
     while step < args.max_iters:
         optimizer.zero_grad(set_to_none=True)
@@ -288,13 +321,45 @@ def train(args,logger):
 
             t0 = time.time()
         
+        # This saves checkpoint for downstream tasks
         if (step + 1) % args.save_every == 0:
             # added for multi-GPU
             if (not is_dist) or (global_rank == 0):
                 path = save_checkpoint(
                     args, step + 1, model,
                 )
-                logger.info(f"Saved checkpoint: {path}")
+                logger.info(f"Saved checkpoint for downstream initialization: {path}")
+
+        # This saves checkpoint for resume training 
+        if (step + 1) % args.save_every == 0:
+            if (not is_dist) or (global_rank == 0):
+                os.makedirs(args.ckpt_dir, exist_ok=True)
+                ckpt_name = f"vicreg_step_{step+1:06d}.pth"
+                path = os.path.join(args.ckpt_dir, ckpt_name)
+
+                save_training_state(
+                    path=path,
+                    args=args,
+                    step=step + 1,
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                )
+
+                if args.keep_last_k > 0:
+                    all_ckpts = sorted(
+                        [f for f in os.listdir(args.ckpt_dir) if f.startswith("vicreg_step_") and f.endswith(".pth")]
+                    )
+                    to_delete = all_ckpts[:-args.keep_last_k]
+                    for old in to_delete:
+                        try:
+                            os.remove(os.path.join(args.ckpt_dir, old))
+                        except OSError:
+                            pass
+
+                logger.info(f"Saved checkpoint for resume: {path}")
 
 
         step += 1 

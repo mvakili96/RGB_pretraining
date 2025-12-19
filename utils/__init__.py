@@ -4,6 +4,8 @@ import datetime
 import torch
 from collections import OrderedDict
 import numpy as np
+from torch.nn.parallel import DistributedDataParallel as DDP
+import random
 
 def get_logger(logdir):
     logger = logging.getLogger("ptsemseg")
@@ -53,6 +55,35 @@ def save_checkpoint(args, step, model, extra=None):
             except OSError: pass
 
     return final_path
+
+def save_training_state(path, args, step, epoch, model, optimizer, scheduler, scaler):
+    """
+    Save everything needed to resume training: model, optimizer, scheduler,
+    AMP scaler, iteration, epoch, RNG states, and args.
+    """
+
+    if isinstance(model, DDP):
+        model_state = model.module.state_dict()
+    else:
+        model_state = model.state_dict()
+
+    state = {
+        "step": step,
+        "epoch": epoch,
+        "model": model_state,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "args": vars(args),
+
+        # RNG states
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng_state": np.random.get_state(),
+        "python_rng_state": random.getstate(),
+    }
+
+    torch.save(state, path)
 
 def tensor_to_image_uint8(t: torch.Tensor, mean, std):
 
